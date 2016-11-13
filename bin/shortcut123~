@@ -1,0 +1,368 @@
+#!/usr/bin/env perl
+# -*- Mode: cperl; cperl-indent-level:4; tab-width: 8; indent-tabs-mode: nil -*-
+# -*- coding: utf-8 -*-
+# vim: set tabstop 8 expandtab:
+
+use 5.012;
+use strict; use warnings;
+use boolean;
+use Fcntl ':flock';
+use File::HomeDir;
+use File::Spec;
+use Time::HiRes qw(usleep CLOCK_REALTIME);
+
+use sigtrap qw(handler handleInterrupt INT);
+use sigtrap qw(handler SigExitOnly untrapped);
+
+use File::Spec;
+use FindBin;
+use lib ( File::Spec->catfile( $FindBin::Bin, '..', 'lib' ) );
+use Pantheon::RunApp;
+
+# remember KISS
+
+our $AppName            = 'shortcut123'; # FIXME
+our $Verbose            = true;
+our $Debug              = false;
+
+our $ReadyToHit         = false;
+our $HitTime            = undef;
+our $HitIntervalTime    = 180_000; # FIXME: read from config file
+our $HitCount           = 0;
+our $MaxHitCount        = 0;
+our $ShortcutName       = '<no name>';
+
+our $TimeBeg            = undef;
+our $TimeOut            = undef;
+
+sub StatusHitMaxCount () { 'hit_max' }
+sub doesHitMaxCount   () { boolean( $HitCount >= $MaxHitCount ) }
+
+# pre-declaration:
+# public:
+sub prepareConfigDirectory ($);
+# private:
+sub dmsg (@);
+sub die_ (@);
+sub info(@);
+sub get_clock_now_ ();
+sub get_timeout_ ($);
+sub get_shortcut_prog_args_ ($);
+
+# simple message functions
+if ( $Debug )   {
+    require Carp; Carp->import();
+    $Carp::CarpLevel = 1; # dirty
+    *dmsg = sub (@) { Carp::carp ( "[$AppName:$$] ", @_ ); };
+    *die_ = sub (@) { Carp::crock( "[$AppName:$$] ", @_ ); };
+}
+else            { *dmsg = sub (@) {}; *die_ = \&CORE::die; }
+
+if ( $Verbose ) {
+    *info = $Debug
+      ? \&dmsg
+      : sub (@) { say STDERR @_  };
+}
+else            { *info = sub (@) {}; }
+
+sub help() {
+    print <<__HELP_MESSAGE__;
+this is help message
+__HELP_MESSAGE__
+}
+
+
+info "$AppName starts: process number : $$";
+
+# first argument is shortcut name
+$ShortcutName = shift @ARGV;
+
+if ( not defined $ShortcutName
+     or          $ShortcutName =~ /^---[0-9]+/ ) {
+    help();
+    exit 1;
+}
+info "First argument is 'Shortcut Name': $ShortcutName";
+
+my @hit_handler_nums_ = ();
+my @HitHandlerArgNums = ();
+my $curr_handler_num = undef;
+
+# get max hits which can be hit by user: inspect arguments ...
+for my $i ( 0.. $#ARGV ) {
+    if ( $ARGV[$i] =~ m/^---([0-9]+)$/ ) {
+        $curr_handler_num = $1;
+        push @hit_handler_nums_, $curr_handler_num;
+
+        if ( $curr_handler_num > $MaxHitCount ) {
+            $MaxHitCount = $curr_handler_num;
+        }
+        $HitHandlerArgNums[$curr_handler_num - 1] = [];
+    }
+}
+
+dmsg "registered handler numbers are: ".join( ", ", @hit_handler_nums_ );
+info "Maximum handler number is: $MaxHitCount";
+
+if ( not defined $curr_handler_num ) {
+    die_ "Processing arguments without handler number".
+      ": must providoe at least one handler by adding: ---1: exit !!!";
+}
+
+# get handler and handler arguments from command line
+$curr_handler_num = undef;
+
+for my $i ( 0.. $#ARGV ) {
+    if ( $ARGV[$i] =~ m/^---([0-9]+)$/ ) {
+        $curr_handler_num = $1;
+        next;
+    }
+
+    if ( not defined $curr_handler_num ) {
+        dmsg "get arguments before getting handler number: assuming number 1";
+        $curr_handler_num = 1;
+    }
+
+    dmsg "current handler num: $curr_handler_num, current index: $i";
+    push @{ $HitHandlerArgNums[$curr_handler_num - 1] }, $i;
+}
+
+# private:
+my  $record_locked_ = false;
+my  $record_file_handle_ = undef;
+sub  open_and_lock_ex_record_ ();
+sub  write_and_unlock_record_ ($$$);
+sub  read_record_ ();
+
+# get click interval time from the file (FIXME)
+# save current click(hit) time into the file
+#    which has name of its process number
+$TimeBeg = get_clock_now_();
+$TimeOut = get_timeout_( $TimeBeg );
+$HitTime = $TimeBeg;
+
+my $config_dir = prepareConfigDirectory( $AppName );
+if ( not defined $config_dir ) {
+    die_ "could not specify a config directory";
+}
+
+our $hitRecordFile =
+  File::Spec->catfile( $config_dir, $ShortcutName );
+
+my ( $pid, $prev_hit_time, $status ) = read_record_();
+$ReadyToHit = true;
+
+if ( not defined $pid ) {
+    dmsg "does not have or cannot find hit time file: $hitRecordFile";
+}
+else {
+    # ref: http://perldoc.perl.org/perlipc.html#Signals
+    if ( kill ( 0 => $pid ) || $!{EPERM} ) {
+        if ( $TimeBeg - $prev_hit_time < $HitIntervalTime ) {
+            dmsg "interrupting previous process($pid) to update timestamp";
+            kill INT => $pid; # this will update timesatmp
+        }
+    }
+    else {
+        dmsg "$pid looks dead: ignore the record";
+        $pid = undef;
+    }
+}
+
+# previous process MIGHT hit the MaxHitCount already and executed a programme.
+if ( defined $pid ) {
+    my ( undef, $prev_hit_time, $status ) = read_record_();
+    if ( $status eq StatusHitMaxCount ) {
+        info "Previous process already executed a programme: make another run";
+    }
+    else {
+        # use previous process
+        info "Use previous process only: exit...";
+        exit 0;
+    }
+}
+
+info "This is first hit!";
+$HitCount = 1;
+if ( not open_and_lock_ex_record_() ) {
+    info "failed to open and lock the record";
+}
+write_and_unlock_record_( $$, $HitTime, $HitCount );
+info "Will execute an external programme in $HitIntervalTime usec.";
+
+wait_until_timeout:
+# note: look at handleInterrupt() what happens when interrupted.
+my $usec_to_wait = int( ( $TimeOut - get_clock_now_() ) * 1.0e6 );
+my $need_to_wait = boolean( $usec_to_wait > 0.0 );
+if ( $need_to_wait ) {
+    info "Really wait for $usec_to_wait usec.";
+    usleep( $usec_to_wait );
+}
+
+if ( doesHitMaxCount() ) {
+    $need_to_wait = false;
+    info "Hit the Maximum Hit Count: $MaxHitCount: do not wait any more";
+}
+
+if ( not $need_to_wait ) {
+    info "Time out with $HitCount hit(s) !!!";
+}
+else {
+    goto wait_until_timeout;
+}
+
+my ( $prog_name, @prog_args ) = get_shortcut_prog_args_( $HitCount );
+if ( not defined $prog_name ) {
+    die_ "Programme is not defined for Hit Number: $HitCount";
+}
+
+open_and_lock_ex_record_();
+write_and_unlock_record_( $$, $HitTime, StatusHitMaxCount );
+
+# execute real programme
+require File::Which;    File::Which->import();
+my $prog_real = File::Which::which( $prog_name );
+
+if ( not defined $prog_real ) {
+    die_ "Programme(or App) not found: $prog_name";
+}
+
+info "Exec: $prog_real: with args: @prog_args";
+exec( $prog_real, @prog_args );
+
+# public:
+sub prepareConfigDirectory ($) {
+    my $config_dir =
+      File::Spec->catdir( File::Spec->splitdir( File::HomeDir->my_home ),
+                          ( '.config', $_[0] )
+                        );
+
+  if ( not -d $config_dir ) {
+      warn "$config_dir does not exists: making one";
+      mkdir $config_dir;
+  }
+
+    return ( -d $config_dir ) ? $config_dir : undef;
+}
+
+sub handleInterrupt () {
+    # just increase hit count when get SIGINT
+    if ( not $ReadyToHit ) {
+        dmsg "too early to intterupt !!!";
+        return;
+    }
+    dmsg "caught SIGINT\n";
+
+    ++$HitCount if $HitCount < $MaxHitCount;
+    $HitTime = get_clock_now_();
+    $TimeOut = get_timeout_( $HitTime );
+
+    info "Current hit: $HitCount";
+    # more chance to lock properly.
+    open_and_lock_ex_record_() if doesHitMaxCount;
+}
+
+sub SigExitOnly () {
+    dmsg "caught a signal: exit without action";
+    exit 0;
+}
+
+# private:
+sub get_timeout_ ($) {
+    my $begining = $_[0];
+    $begining + $HitIntervalTime * 1.0e-6;
+}
+
+sub get_clock_now_ () {
+    Time::HiRes::clock_gettime( CLOCK_REALTIME );
+}
+
+sub get_shortcut_prog_args_ ($) {
+    my $hits = $_[0];
+    if ( not defined $hits ) {
+        dmsg "no hit count given: return undef";
+        return undef;
+    }
+
+    $hits = $MaxHitCount if $hits > $MaxHitCount;
+
+    if ( $Debug ) {
+        local $" = ", ";
+        my $arg_nums = "@{$HitHandlerArgNums[ $hits - 1 ]}";
+        dmsg "argument numbers are: $arg_nums";
+    }
+    return @ARGV[ @{ $HitHandlerArgNums[ $hits - 1] } ];
+}
+
+sub open_and_lock_ex_record_ ()  {
+    return true if $record_locked_;
+
+    if ( not open $record_file_handle_, '>', $hitRecordFile ) {
+        dmsg "could not open the record file for Writing.";
+        return undef;
+    }
+    my $max_num_try = 1000;
+    my $try_count = 0;
+  locking_file:
+    {
+        if ( ++$try_count > $max_num_try ) {
+            dmsg "hit maximum try: $max_num_try: failed to write the record";
+            return false;
+        }
+
+
+        if ( ! flock( $record_file_handle_, LOCK_EX|LOCK_NB ) ) {
+            dmsg "windows record file is locked: trying in 0.005 sec";
+            usleep( 5000 );
+            redo locking_file;
+        }
+    }
+
+    return ( $record_locked_ = true );
+}
+
+sub read_record_ () {
+    if ( -r $hitRecordFile
+         and
+         open my $record_fh, '<', $hitRecordFile ) {
+      locking_file:
+        {
+            if ( ! flock $record_fh, LOCK_EX|LOCK_NB) {
+                dmsg "hit record file is locked: trying in 0.005 sec";
+                usleep( 5000 );
+                redo locking_file;
+            }
+        }
+
+        my $data = <$record_fh>;
+        chomp $data;
+
+        flock $record_fh, LOCK_UN;
+        close $record_fh;
+
+        return split( ":", $data );
+    }
+    return undef;
+}
+
+sub write_and_unlock_record_ ($$$) {
+    my ( $pid, $timestamp, $hit_count ) = @_;
+
+    if ( not defined $record_file_handle_ ) {
+        dmsg "record file is not open yet.";
+        return false;
+    }
+
+    my $max_num_try = 1000;
+    my $try_count = 0;
+
+    print $record_file_handle_ "$pid:$timestamp:$hit_count";
+    if ( $record_locked_ ) {
+        flock $record_file_handle_, LOCK_UN;
+        $record_locked_ = false;
+    }
+    close $record_file_handle_;
+    $record_file_handle_ = undef;
+}
+
+die "very end: impossible";

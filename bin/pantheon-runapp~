@@ -1,0 +1,35 @@
+#!/bin/sh
+
+SHORTCUT_PROG=eos-shortcut123
+FOCUSWIN_PROG=eos-focuswin
+
+# FIXME: it's not really usefull for interactive shell
+
+if [ x$1 = "x" ]; then
+    prog=${0##*/}
+    echo "Usage: $prog \"APP CLASS NAME\" \"[REAL APP FILE NAME:if it's different]\""
+    echo "ex:    $prog urxvt"
+    exit 1
+fi
+
+APP_NAME=$1
+APP_PROG=$2
+
+if [ x$APP_PROG = "x" ]; then
+    APP_PROG=$APP_NAME
+fi
+
+# for local perl environment
+if [ -d "${HOME}/perl5" ]; then
+    export PATH=$HOME/bin:$PATH
+    PATH="${HOME}/perl5/bin${PATH+:}${PATH}"; export PATH;
+    PERL5LIB="${HOME}/perl5/lib/perl5${PERL5LIB+:}${PERL5LIB}"; export PERL5LIB;
+    PERL_LOCAL_LIB_ROOT="${HOME}/perl5${PERL_LOCAL_LIB_ROOT+:}${PERL_LOCAL_LIB_ROOT}"; export PERL_LOCAL_LIB_ROOT;
+    PERL_MB_OPT="--install_base \"${HOME}/perl5\""; export PERL_MB_OPT;
+    PERL_MM_OPT="INSTALL_BASE=${HOME}/perl5"; export PERL_MM_OPT;
+fi
+
+exec $SHORTCUT_PROG "$APP_NAME" \
+     ::1 $FOCUSWIN_PROG "$APP_NAME" "$APP_PROG" --focus=prev \
+     ::2 $FOCUSWIN_PROG "$APP_NAME" "$APP_PROG" --focus=new \
+     1>> "$HOME/runapp-errors" 2>&1

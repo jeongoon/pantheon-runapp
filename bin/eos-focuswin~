@@ -1,0 +1,376 @@
+#!/usr/bin/env perl
+# -*- Mode: cperl; cperl-indent-level:4; tab-width: 8; indent-tabs-mode: nil -*-
+# -*- coding: utf-8 -*-
+# vim: set tabstop 8 expandtab:
+
+# This is part of pantheon-runapp
+# Copyright (c) 2016 JEON Myoungjin <jeongoon@gmail.com>
+
+use 5.012;
+use strict; use warnings;
+use FindBin;
+use boolean;
+use feature qw(switch);
+use Fcntl ':flock';
+use File::HomeDir;
+use File::Spec;
+use File::Which;
+use Time::HiRes qw(CLOCK_REALTIME);
+use OptArgs;
+
+our $Verbose = false;
+our $Debug   = true;
+our @ExecutableArgs;
+our $xdotool_prog;
+
+if ( $Verbose or $Debug ) { *dmsg = sub { warn @_ }; }
+else                      { *dmsg = sub {};          }
+
+$xdotool_prog = File::Which::which( 'xdotool' );
+if ( not defined $xdotool_prog ) {
+    # undef when it does not find the executable
+    die "please install: xdotool";
+}
+
+# record index names ...
+sub F_TIMEADDED () { 0 }
+sub F_FOCUSED   () { 1 }
+
+my $i = 0;
+for $i ( 0 .. $#ARGV ) {
+    if ( defined $ARGV[$i] and $ARGV[$i] eq '--' ) {
+        dmsg( "init: Found `--': save rest arguments as Executable arguments separately" );
+        last;
+    }
+}
+
+if ( $i > 0 and $i != scalar @ARGV ) {
+    @ExecutableArgs = splice( @ARGV, $i );
+    shift @ExecutableArgs; # don't need '--'
+}
+
+
+my @focus_modes = qw(last prev new);
+my $focus_modes_list_ = "[ " . join( ", ", @focus_modes ) . " ]";
+
+opt focus =>
+  ( isa         => 'Str',
+    default     => 'last',
+    comment     =>  "Focus modes: $focus_modes_list_" );
+
+#opt check_windowsize =>
+#  ( isa         => 'Bool',
+#    default     =>  1,
+#    comment     => 'Check window size after searching by name' );
+
+arg name =>
+  ( isa         => 'Str',
+    required    => 1,
+    comment     => 'Search string for window [class] name' );
+
+arg exe =>
+  ( isa         => 'Str',
+    required    => 1,
+    comment     => 'Executable programme for name: for newly-created window'
+  );
+
+my $opts = optargs;
+
+our $FocusMode  = $opts->{'focus'};
+our $SearchName = $opts->{'name'};
+our $Executable = $opts->{'exe'};
+
+
+# private:
+sub search_window_by_class_ {
+    my $key = pop;
+    my $result = qx($xdotool_prog search --onlyvisible --class $key);
+    split($/, $result);
+}
+
+sub search_window_by_pid_ {
+    my $key = pop;
+    my $result = qx($xdotool_prog search --onlyvisible --pid $key);
+    split($/, $result);
+}
+
+sub get_window_geometry_ {
+    my $window_id = pop;
+    my $result = qx($xdotool_prog getwindowgeometry $window_id);
+    return( $result =~ m/Position: (\d+),(\d+).*Geometry: (\d+)x(\d+)/s );
+}
+
+sub get_active_window_id_ () {
+    my $result = qx($xdotool_prog getactivewindow);
+    chomp $result;
+    $result;
+}
+
+sub focus_raise_window_ {
+    my $window_id = pop;
+    my $result = qx($xdotool_prog windowactivate $window_id)
+}
+
+# main;
+if ( scalar( grep( /$FocusMode/, @focus_modes ) ) <= 0 ) {
+    die "Invalid \$FocusMode ($FocusMode): use one of $focus_modes_list_";
+}
+
+my @window_ids = search_window_by_class_( $SearchName );
+
+my $check_window_size_ = false;
+my $minimum_window_width = 100;
+my $minimum_window_height = 100;
+
+my @windows_found;
+# time stamp for windows which is addded to list newly.
+my $timestamp_new = Time::HiRes::clock_gettime( CLOCK_REALTIME );
+
+my $config_dir =
+  File::Spec->catdir( File::Spec->splitdir( File::HomeDir->my_home ),
+                      qw(.config smart_focus_win)
+                   );
+
+if ( not -d $config_dir ) {
+    dmsg( "$config_dir does not exists: made one" );
+    mkdir $config_dir;
+}
+
+my $windows_record_file =
+  File::Spec->catfile( $config_dir,
+                       $SearchName.'.rec' );
+
+each_window_id:
+for my $wid ( @window_ids ) {
+    # find proper biggest window in visible
+    my @poor_geom = get_window_geometry_( $wid );
+    if ( scalar @poor_geom != 4 ) {
+        if ( not defined $_ ) {
+            dmsg( "FIXME: couldn't find geometry from $wid" );
+            next each_window_id;
+        }
+    }
+    if ( $check_window_size_
+         and (  $poor_geom[2] < $minimum_window_width and
+                $poor_geom[3] < $minimum_window_height ) ) {
+        dmsg( "window($wid) doee not have enough visible window: skipped." );
+        next each_window_id;
+    }
+
+    push @windows_found, $wid;
+}
+
+scalar @windows_found and
+  dmsg( "found windows for the search key ($SearchName):" );
+
+
+# XXX: already sorted?
+my @windows_found_copy = sort @windows_found;
+
+# get last window list
+# window list looks like ...
+
+# 00000000 #timestamp -
+# 00000001 #timestamp *  -> last focused
+# 00000002 #timestamp -
+# 00000003 #timestamp -
+
+# so we can group the windows by
+#   o last focused window
+#   o second last focused window
+#   o other windows
+
+my @last_windows_record = ();
+my $last_window_focused;
+my $new_window_to_focus;
+
+my @current_windows_list;
+my %current_windows_info;
+
+if ( -r $windows_record_file
+     and
+     open my $record_fh, '<:encoding(UTF-8)', $windows_record_file ) {
+
+    locking_file:
+    {
+        if ( ! flock $record_fh, LOCK_EX|LOCK_NB ) {
+            dmsg( "windows record file is locked: trying in 0.1 sec" );
+            Time::HiRes::usleep( 100 );
+            redo locking_file;
+        }
+    }
+
+    my $line_sep = $/;
+    local $/ = undef;
+    my $data = <$record_fh>;
+    @last_windows_record = split ( $line_sep, $data );
+    flock $record_fh, LOCK_UN;
+    close $record_fh;
+}
+else {
+    dmsg( "do not have or can not find a record file yet:".
+          " windows record is empty." );
+}
+
+windows_record_:
+for my $ri ( 0 .. $#last_windows_record ) {
+    $last_windows_record[$ri] =~
+      m/(\d+)\s([\d\.]+)(?:\s*([\*-]))$/;
+
+    my ( $window_id, $timestamp_rec, $focus_status ) = ( $1, $2, $3 );
+
+    if ( not defined $window_id ) {
+       dmsg( "unrecognized line: $ri: $last_windows_record[$ri]" );
+        next;
+    }
+    my $still_exists_ = false;
+
+    for my $wi ( 0 .. $#windows_found_copy ) {
+        if ( defined $windows_found_copy[$wi]
+             and $window_id eq $windows_found_copy[$wi] ) {
+            $still_exists_ = true;
+            $windows_found_copy[$wi] = undef;
+            last;
+        }
+    }
+
+    if ( not $still_exists_ ) {
+        dmsg( "window has been destroyed: $window_id: removed fom the list" );
+        next windows_record_;
+    }
+
+    if ( $focus_status eq '*' ) {
+        $last_window_focused = $window_id;
+    }
+
+
+    push @current_windows_list, $window_id;
+    # note: reset focus status to '-';
+    $current_windows_info{$window_id} = [ $timestamp_rec, '-' ];
+}
+
+# add newly-created windows to the list
+for my $wid ( @windows_found_copy ) {
+    next if not defined $wid;
+
+    push @current_windows_list, $wid;
+    $current_windows_info{$wid} = [ $timestamp_new, '-' ];
+}
+
+# sort by timestamp
+@current_windows_list = sort {
+    # descend order: so newer window has lower
+    $current_windows_info{$b}[F_TIMEADDED]
+      <=> $current_windows_info{$a}[F_TIMEADDED];
+} @current_windows_list;
+
+
+
+my $active_window_id = get_active_window_id_();
+
+dmsg( "current focus mode is: `$FocusMode'" );
+
+# re-check focus mode if necessary
+if ( defined $last_window_focused
+     and $last_window_focused == $active_window_id
+     and $FocusMode eq 'last' ) {
+    dmsg( "trying to focus last focused window($last_window_focused)".
+          " but which still has focus".
+          ": try to focus second last focused window" );
+    $FocusMode = 'prev';
+}
+
+make_new_window:
+if ( $FocusMode eq 'new' ) {
+    # anyway we want to create new window
+    my $pid = fork;
+    if ( not defined $pid ) {
+        die "Could not fork";
+    }
+    if ( $pid == 0 ) { # child process
+        exec( $Executable, @ExecutableArgs );
+        die "child process already execed: never reach here";
+        exit 1;
+    }
+    else { # parent process
+        # find window has $pid
+        for ( 1..10 ) { # try 10 times ...
+            Time::HiRes::usleep( 10 );
+            my $wid = search_window_by_pid_( $pid );
+            # FIXME: if wee couldn't find $wid ...
+            $new_window_to_focus = $wid;
+        }
+    }
+}
+elsif ( $FocusMode eq 'prev' ) {
+    # find the window in the current window list
+    # and focus previous window
+    # note: current window list is sorted by time descending order.
+    my $curr_wid = $last_window_focused || $active_window_id;
+
+    my $maybe_found_wid = undef;
+    for my $wi ( 0 .. $#current_windows_list ) {
+        if ( $current_windows_list[$wi] == $curr_wid ) {
+            $maybe_found_wid = $current_windows_list[ $wi + 1 ];
+            # $wi + 1 : it may be out range of the scope but we will check later
+            last;
+        }
+    }
+    $maybe_found_wid ||= $current_windows_list[0];
+
+    # still chance to undefined but no worries.
+    # we don't have any window to focus now.
+    $new_window_to_focus = $maybe_found_wid;
+}
+else { # must be $FocusMode eq 'last'
+    if ( defined $last_window_focused ) {
+        dmsg( "last focused window is ready to be focused again" );
+        $new_window_to_focus = $last_window_focused;
+    }
+    else {
+        # try most recently added window
+        dmsg( "try most recently added window" );
+        $new_window_to_focus = $current_windows_list[0];
+    }
+}
+
+if ( defined $new_window_to_focus ) {
+    dmsg( "focusing window ($new_window_to_focus)" );
+    focus_raise_window_( $new_window_to_focus );
+}
+else {
+    dmsg( "no window to focus: try to make new window ..." );
+    $FocusMode = 'new';
+    goto make_new_window;
+}
+
+# update window list
+
+# note: already dead if we don't have $new_window_to_focus;
+${$current_windows_info{ $new_window_to_focus }}[ F_FOCUSED ] = '*';
+
+
+open my $record_fh, '>', $windows_record_file
+  or die "could not write the record($windows_record_file): $!";
+
+locking_file:
+{
+    if ( ! flock $record_fh, LOCK_EX|LOCK_NB ) {
+        dmsg( "windows record file is locked: trying in 0.1 sec" );
+        Time::HiRes::usleep( 100 );
+        redo locking_file;
+    }
+}
+
+for my $rec ( @current_windows_list ) {
+    my $line = join( " ",  $rec, @{$current_windows_info{$rec}} );
+    if ( $Debug ) { say STDERR $line; }
+    say $record_fh $line;
+
+}
+dmsg( "total ".scalar(@current_windows_list)." record".(scalar(@current_windows_list)>1 ? "s" : "")." written." );
+
+flock $record_fh, LOCK_UN;
+close $record_fh;
+
+exit 0;
