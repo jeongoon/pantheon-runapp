@@ -12,8 +12,8 @@ use boolean;
 use FindBin;
 use File::Spec;
 use lib ( File::Spec->catfile( $FindBin::RealBin, '..', 'lib' ) );
-use eOS::RunApp
-  ( -AppName => 'eos-shortcut123',
+use PantheonDE::RunApp
+  ( -AppName => 'shortcut123',
     -Debug   => true,
     -Verbose => true,
     qw(fs getClockNow prepareConfigDirectory :msg)
@@ -26,13 +26,13 @@ use Time::HiRes qw(usleep);
 
 use sigtrap qw(handler handleInterrupt INT);
 use sigtrap qw(handler SigExitOnly untrapped);
-#
+
 # remember KISS
-#
+
 
 # Application common variable
 $::Config               = { HitIntervalTime => 180_000 };
-@::ConfigNames          = qw(HitIntervalTime);
+#@::ConfigNames          = qw(HitIntervalTime);
 
 # File common variable
 our $ReadyToHit         = false;
@@ -44,7 +44,7 @@ our $ShortcutName       = '<no name>';
 our $TimeBeg            = undef;
 our $TimeOut            = undef;
 
-sub StatusHitMaxCount  () { 'hit_max' }
+sub StatusHitMaxCount  () { 'max' }
 sub doesHitMaxCount    () { boolean( $HitCount >= $MaxHitCount ) }
 sub getHitIntervalTime () { $::Config->{'HitIntervalTime'} }
 
@@ -66,7 +66,7 @@ info getAppName()." starts: version: $VERSION, process number: $$";
 $ShortcutName = shift @ARGV;
 
 if ( not defined $ShortcutName
-     or          $ShortcutName =~ m/^\+\+[0-9]+/ ) {
+     or          $ShortcutName =~ m/^\+\+[0-9]+/ ) { # ++1, ++2, ++3 ...
     help();
     exit 1;
 }
@@ -169,7 +169,7 @@ if ( defined $pid ) {
     }
 }
 
-info "This is first hit!";
+info "This is first stroke!";
 $HitCount = 1;
 if ( not open_and_lock_ex_record_() ) {
     leave "failed to open and lock the record";
@@ -192,11 +192,11 @@ if ( doesHitMaxCount() ) {
     info "Hit the Maximum Hit Count: $MaxHitCount: do not wait any more";
 }
 
-if ( not $need_to_wait ) {
-    info "Time out with $HitCount hit(s) !!!";
+if ( $need_to_wait ) {
+    goto wait_until_timeout;
 }
 else {
-    goto wait_until_timeout;
+    info "Time out with $HitCount stroke(s) !!!";
 }
 
 my ( $prog_name, @prog_args ) = get_shortcut_prog_args_( $HitCount );
@@ -246,8 +246,8 @@ sub SigExitOnly () {
 
 private:
 sub get_timeout_ ($) {
-    my $begining = $_[0];
-    return $begining + getHitIntervalTime() * 1.0e-6;
+    my $beginning = $_[0];
+    return $beginning + getHitIntervalTime() * 1.0e-6;
 }
 
 sub get_shortcut_prog_args_ ($) {
@@ -283,9 +283,8 @@ sub open_and_lock_ex_record_ ()  {
             return false;
         }
 
-
         if ( ! flock( $record_file_handle_, LOCK_EX|LOCK_NB ) ) {
-            dmsg "windows record file is locked: trying in 0.005 sec";
+            dmsg "windows record file is locked: trying in 5000 usec";
             usleep( 5000 );
             redo locking_file;
         }
