@@ -92,7 +92,7 @@ sub search_window_by_class_ {
 
 sub search_window_by_pid_ {
     my $key = pop;
-    my $result = qx($xdotool_prog search --onlyvisible --pid $key);
+    my $result = qx($xdotool_prog search --pid $key);
     split( $/, $result );
 }
 
@@ -152,8 +152,10 @@ for my $wid ( @window_ids ) {
     push @windows_found, $wid;
 }
 
-scalar @windows_found and
-  info"found windows for the search key ($SearchName):";
+my $total_windows_found = scalar @windows_found;
+$total_windows_found > 0 and
+  info "found windows for the search key ($SearchName):".
+  " total $total_windows_found window(s): @windows_found";
 
 # XXX: already sorted?
 my @windows_found_copy = sort @windows_found;
@@ -161,10 +163,10 @@ my @windows_found_copy = sort @windows_found;
 # get last window list
 # window list looks like ...
 
-# 00000000:#timestamp# -
-# 00000001:#timestamp# *  -> last focused
-# 00000002:#timestamp# -
-# 00000003:#timestamp# -
+# 00000000 #timestamp# -
+# 00000001 #timestamp# *  -> last focused
+# 00000002 #timestamp# -
+# 00000003 #timestamp# -
 
 # so we can group the windows by
 #   o last focused window
@@ -204,8 +206,8 @@ if ( -r $windowRecordFile
     close $record_fh;
 }
 else {
-    info( "do not have or can not find a record file yet:".
-          " windows record is empty." );
+    info "do not have or can not find a record file yet:".
+      " windows record is empty.";
 }
 
 windows_record_:
@@ -216,7 +218,7 @@ for my $ri ( 0 .. $#last_windows_record ) {
     my ( $window_id, $timestamp_rec, $focus_status ) = ( $1, $2, $3 );
 
     if ( not defined $window_id ) {
-       info( "unrecognized line: $ri: $last_windows_record[$ri]" );
+       info "unrecognized line: $ri: $last_windows_record[$ri]";
         next;
     }
     my $still_exists_ = false;
@@ -231,7 +233,7 @@ for my $ri ( 0 .. $#last_windows_record ) {
     }
 
     if ( not $still_exists_ ) {
-        info( "window has been destroyed: $window_id: removed fom the list" );
+        info "window has been destroyed: $window_id: removed fom the list";
         next windows_record_;
     }
 
@@ -264,15 +266,15 @@ for my $wid ( @windows_found_copy ) {
 
 my $active_window_id = get_active_window_id_();
 
-info( "current focus mode is: `$FocusMode'" );
+info "current focus mode is: `$FocusMode'";
 
 # re-check focus mode if necessary
 if ( defined $last_window_focused
      and $last_window_focused == $active_window_id
      and $FocusMode eq 'last' ) {
-    info( "Trying to focus last focused window($last_window_focused)".
-          " but which still has focus".
-          ": try to focus second last focused window" );
+    info "Trying to focus last focused window($last_window_focused)".
+      " but which still has focus".
+      ": try to focus second last focused window";
     $FocusMode = 'prev';
 }
 
@@ -284,21 +286,17 @@ if ( $FocusMode eq 'new' ) {
         leave "Could not fork";
     }
     if ( $pid == 0 ) { # child process
+        dmsg "in child process.";
         {
             no warnings 'exec';
-            info 'leaving ...: start a new process';
+            info "leaving ...: execute new application: $BinaryName";
             exec( $BinaryName, @BinaryArgs );
-            leave "child process already execed: never reach here";
         }
     }
     else { # parent process
-        # find window has $pid
-        for ( 1..10 ) { # try 10 times ...
-            Time::HiRes::usleep( 10 );
-            my $wid = search_window_by_pid_( $pid );
-            # FIXME: if wee couldn't find $wid ...
-            $new_window_to_focus = $wid;
-        }
+        $new_window_to_focus = -1;
+        info "child process id: $pid";
+        dmsg "new windows supposed to have focus when created";
     }
 }
 elsif ( $FocusMode eq 'prev' ) {
@@ -334,11 +332,16 @@ else { # must be $FocusMode eq 'last'
 }
 
 if ( defined $new_window_to_focus ) {
-    info "Focusing window ($new_window_to_focus)";
-    focus_raise_window_( $new_window_to_focus );
+    if ( $new_window_to_focus == 0 or $FocusMode eq 'new' ) {
+        info "Skip focusing window";
+    }
+    else {
+        info "Focusing window ($new_window_to_focus)";
+        focus_raise_window_( $new_window_to_focus );
+    }
 }
 else {
-    info( "No window to focus: try to make new window ..." );
+    info "No window to focus: try to make a new window ...";
     $FocusMode = 'new';
     goto make_new_window;
 }
@@ -360,7 +363,9 @@ for my $rec ( @current_windows_list ) {
     say $record_fh $line;
 
 }
-info "Total ".scalar(@current_windows_list)." record".(scalar(@current_windows_list)>1 ? "s" : "")." written.";
+
+my $len_rec = scalar @current_windows_list;
+info "Total $len_rec record".( $len_rec >1 ? "s" : "")." written.";
 
 flock $record_fh, LOCK_UN;
 close $record_fh;

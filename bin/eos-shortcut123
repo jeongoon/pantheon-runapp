@@ -171,9 +171,10 @@ if ( defined $pid ) {
 
 info "This is first stroke!";
 $HitCount = 1;
-if ( not open_and_lock_ex_record_() ) {
+
+open_and_lock_ex_record_() or
     leave "failed to open and lock the record";
-}
+
 write_and_unlock_record_( $$, $HitTime, $HitCount );
 info "Will execute an external programme in ".getHitIntervalTime()." usec.";
 
@@ -181,6 +182,7 @@ wait_until_timeout:
 # note: look at handleInterrupt() what happens when interrupted.
 my $usec_to_wait = int( ( $TimeOut - getClockNow() ) * 1.0e6 );
 my $need_to_wait = boolean( $usec_to_wait > 0.0 );
+
 if ( $need_to_wait ) {
     info "Really wait for $usec_to_wait usec.";
     usleep( $usec_to_wait );
