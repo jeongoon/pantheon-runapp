@@ -3,6 +3,8 @@
 
 SHORTCUT_PROG=eos-shortcut123
 FOCUSWIN_PROG=eos-focuswin
+USE_PSEUDO_EXT=1
+VERSION=0.3
 
 # FIXME: it's not really usefull for interactive shell
 
@@ -13,12 +15,29 @@ if [ x$1 = "x" ]; then
         exit 1
 fi
 
+# Elementary OS Loki (0.4) has some bugs on cutom shortcut.
+# command string is damaged somehow.
+# for example,
+# even though I input "urxvt" sometimes it will be changed like "urxv<99>"
+# where <99> means ascii code of 99
+
+# so when you make shorcut command we should append ".runapp" at the end of
+# command or application class name.
+# this programme will remove pseudo extention. '.runap*' to get proper names.
+
+
 APP_NAME=$1
 APP_PROG=$2
 
 if [ x$APP_PROG = "x" ]; then
         APP_PROG=$APP_NAME
 fi
+
+if [ x$USE_PSEUDO_EXT = "x1" ]; then
+        APP_NAME=${APP_NAME%.runap*}
+        APP_PROG=${APP_PROG%.runap*}
+fi
+
 
 # for local perl environment
 if [ -d "${HOME}/perl5" ]; then
@@ -33,6 +52,6 @@ if [ -d "${HOME}/perl5" ]; then
 fi
 
 exec $SHORTCUT_PROG "$APP_NAME" \
-     ++1 $FOCUSWIN_PROG "$APP_NAME" "$APP_PROG" --focus=prev \
+     ++1 $FOCUSWIN_PROG "$APP_NAME" "$APP_PROG" --focus=last \
      ++2 $FOCUSWIN_PROG "$APP_NAME" "$APP_PROG" --focus=new \
      1>> "$HOME/runapp-errors" 2>&1

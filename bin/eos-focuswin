@@ -12,8 +12,6 @@ use boolean;
 use FindBin;
 use feature qw(switch);
 use Fcntl ':flock';
-use File::HomeDir;
-use File::Spec;
 use File::Which;
 use Time::HiRes qw(usleep);
 use OptArgs;
@@ -23,7 +21,7 @@ use PantheonDE::RunApp
   ( -AppName => 'focuswin',
     -Debug   => true,
     -Verbose => true,
-    qw(fs getClockNow prepareConfigDirectory :msg)
+    qw(fs getClockNow prepareConfigDirectory prepareCacheDirectory :msg)
   );
 
 our @BinaryArgs;
@@ -35,9 +33,14 @@ if ( not defined $xdotool_prog ) {
     leave "please install: xdotool";
 }
 
+use version 0.77; our $VERSION = version->declare( 'v0.2.1' );
+info getAppName()." starts: version: $VERSION, process number: $$";
+
 # record index names ...
 sub F_TIMEADDED () { 0 }
 sub F_FOCUSED   () { 1 }
+
+sub ERR_BINARY_NOT_EXECUATBLE () { 2 }
 
 my  $i = 0;
 for $i ( 0 .. $#ARGV ) {
@@ -50,7 +53,7 @@ for $i ( 0 .. $#ARGV ) {
 
 if ( $i > 0 and $i != scalar @ARGV ) {
     @BinaryArgs = splice( @ARGV, $i );
-    shift @BinaryArgs; # shift `--' because we don't need it.
+    shift @BinaryArgs; # remove `--' because we don't need it.
 }
 
 my @focus_modes = qw(last prev new);
@@ -90,11 +93,11 @@ sub search_window_by_class_ {
     split( $/, $result );
 }
 
-sub search_window_by_pid_ {
-    my $key = pop;
-    my $result = qx($xdotool_prog search --pid $key);
-    split( $/, $result );
-}
+#sub search_window_by_pid_ {
+#    my $key = pop;
+#    my $result = qx($xdotool_prog search --pid $key);
+#    split( $/, $result );
+#}
 
 sub get_window_geometry_ {
     my $window_id = pop;
@@ -114,10 +117,10 @@ sub focus_raise_window_ {
 }
 
 # main;
-if ( scalar( grep( /$FocusMode/, @focus_modes ) ) <= 0 ) {
+grep { $_ eq $FocusMode } @focus_modes == 0 and
     leave "Invalid \$FocusMode ($FocusMode): use one of $focus_modes_list_";
-}
 
+my $dbg_numof_making_new_window_ = 0;
 my @window_ids = search_window_by_class_( $SearchName );
 
 my $check_window_size_  = false;
@@ -128,11 +131,15 @@ my @windows_found;
 # time stamp for windows which is addded to list newly.
 my $timestamp_new = getClockNow();
 
-my $config_dir = prepareConfigDirectory( getAppName() );
-if ( ! -d $config_dir ) {
-    leave "could not prepare configuration directory: $config_dir";
-}
-my $windowRecordFile = fs->catfile( $config_dir, $SearchName.'.rec' );
+#my $config_dir = prepareConfigDirectory( getAppName() );
+#-d $config_dir or
+#  leave "could not prepare configuration directory: $config_dir";
+
+my $cache_dir  = prepareCacheDirectory(  getAppName() );
+-d $cache_dir or
+  leave "could not prepare configuration directory: $cache_dir";
+
+my $windowRecordFile = fs->catfile( $cache_dir, $SearchName.'.rec' );
 
 each_window_id:
 for my $wid ( @window_ids ) {
@@ -144,7 +151,7 @@ for my $wid ( @window_ids ) {
     }
     if ( $check_window_size_
          and (  $poor_geom[2] < $minimum_window_width and
-                $poor_geom[3] < $minimum_window_height ) ) {
+                $poor_geom[3] < $minimum_window_height     ) ) {
         dmsg "FIXME: window($wid) does not have enough visible window: skipped.";
         next each_window_id;
     }
@@ -184,8 +191,8 @@ sub lock_record_ ($) {
   locking_file:
     {
         if ( ! flock $fh, LOCK_EX|LOCK_NB ) {
-            dmsg( "windows record file is locked: trying in 100 usec." );
-            usleep( 100 );
+            dmsg "windows record file is locked: trying in 100 usec.";
+            usleep 100;
             redo locking_file;
         }
     }
@@ -218,7 +225,7 @@ for my $ri ( 0 .. $#last_windows_record ) {
     my ( $window_id, $timestamp_rec, $focus_status ) = ( $1, $2, $3 );
 
     if ( not defined $window_id ) {
-       info "unrecognized line: $ri: $last_windows_record[$ri]";
+        info "unrecognized line: $ri: $last_windows_record[$ri]";
         next;
     }
     my $still_exists_ = false;
@@ -238,9 +245,9 @@ for my $ri ( 0 .. $#last_windows_record ) {
     }
 
     if ( $focus_status eq '*' ) {
+        dmsg "Window (ID:$window_id) (was/is) last focused";
         $last_window_focused = $window_id;
     }
-
 
     push @current_windows_list, $window_id;
     # note: reset focus status to '-';
@@ -265,6 +272,7 @@ for my $wid ( @windows_found_copy ) {
 
 
 my $active_window_id = get_active_window_id_();
+dmsg "Current Active Window ID is $active_window_id";
 
 info "current focus mode is: `$FocusMode'";
 
@@ -289,8 +297,13 @@ if ( $FocusMode eq 'new' ) {
         dmsg "in child process.";
         {
             no warnings 'exec';
-            info "leaving ...: execute new application: $BinaryName";
-            exec( $BinaryName, @BinaryArgs );
+            my $bin = File::Which::which( $BinaryName );
+            defined $bin and
+              info "leaving ...: execute new application: $BinaryName",
+              exec $BinaryName, @BinaryArgs;
+
+            info "$BinaryName is not executable: exit";
+            exit ERR_BINARY_NOT_EXECUATBLE;
         }
     }
     else { # parent process
@@ -343,6 +356,9 @@ if ( defined $new_window_to_focus ) {
 else {
     info "No window to focus: try to make a new window ...";
     $FocusMode = 'new';
+    if ( isDebugging and ++$dbg_numof_making_new_window_ > 100 ) {
+        leave "something maybe went to wrong: stop making new window: quit.";
+    }
     goto make_new_window;
 }
 

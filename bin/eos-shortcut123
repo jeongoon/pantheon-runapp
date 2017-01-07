@@ -16,10 +16,10 @@ use PantheonDE::RunApp
   ( -AppName => 'shortcut123',
     -Debug   => true,
     -Verbose => true,
-    qw(fs getClockNow prepareConfigDirectory :msg)
+    qw(fs getClockNow prepareConfigDirectory prepareCacheDirectory :msg)
   );
 
-use version 0.77; our $VERSION = version->declare( 'v0.1' );
+use version 0.77; our $VERSION = version->declare( 'v0.2.1' );
 
 use Fcntl ':flock';
 use Time::HiRes qw(usleep);
@@ -28,7 +28,7 @@ use sigtrap qw(handler handleInterrupt INT);
 use sigtrap qw(handler SigExitOnly untrapped);
 
 # remember KISS
-
+# term: I use term of 'hit' as a keyboard stroke
 
 # Application common variable
 $::Config               = { HitIntervalTime => 180_000 };
@@ -40,13 +40,22 @@ our $HitTime            = undef;
 our $HitCount           = 0;
 our $MaxHitCount        = 0;
 our $ShortcutName       = '<no name>';
-
 our $TimeBeg            = undef;
 our $TimeOut            = undef;
+our %time_unit_scale_   = ( 'usec' => 1,
+                            'msec' => 1.0e-3,
+                            'sec'  => 1.0e-6  );
 
 sub StatusHitMaxCount  () { 'max' }
 sub doesHitMaxCount    () { boolean( $HitCount >= $MaxHitCount ) }
-sub getHitIntervalTime () { $::Config->{'HitIntervalTime'} }
+sub getHitIntervalTime ($) {
+    my $unit = pop;
+    exists $time_unit_scale_{$unit} or
+      dmsg "unrecognized unit: $unit: use default: usec",
+      $unit = 'usec';
+
+    $::Config->{'HitIntervalTime'} * $time_unit_scale_{$unit};
+}
 
 # pre-declaration
 # private:
@@ -70,13 +79,14 @@ if ( not defined $ShortcutName
     help();
     exit 1;
 }
+
 info "First argument is 'Shortcut Name': $ShortcutName";
 
 my @hit_handler_nums_ = ();
 my @HitHandlerArgNums = ();
 my $curr_handler_num = undef;
 
-# get max hits which can be hit by user: inspect arguments ...
+# get maximum number of hits which can be hit by user: inspect arguments ...
 for my $i ( 0.. $#ARGV ) {
     if ( $ARGV[$i] =~ m/^\+\+([0-9]+)$/ ) {
         $curr_handler_num = $1;
@@ -94,14 +104,14 @@ info "Maximum handler number is: $MaxHitCount";
 
 if ( not defined $curr_handler_num ) {
     leave "Processing arguments without handler number".
-      ": must providoe at least one handler by adding: ---1: exit !!!";
+      ": must providoe at least one handler by adding: ++1: exit !!!";
 }
 
 # get handler and handler arguments from command line
 $curr_handler_num = undef;
 
 for my $i ( 0.. $#ARGV ) {
-    if ( $ARGV[$i] =~ m/^\+\+([0-9]+)$/ ) {
+   if ( $ARGV[$i] =~ m/^\+\+([0-9]+)$/ ) {
         $curr_handler_num = $1;
         next;
     }
@@ -118,6 +128,7 @@ for my $i ( 0.. $#ARGV ) {
 # private:
 our  $record_locked_            = false;
 our  $record_file_handle_       = undef;
+our  $dbg_numof_waiting_        = 0;
 sub  open_and_lock_ex_record_   ();
 sub  write_and_unlock_record_   ($$$);
 sub  read_record_               (;$);
@@ -129,12 +140,16 @@ $TimeBeg = getClockNow();
 $TimeOut = get_timeout_( $TimeBeg );
 $HitTime = $TimeBeg;
 
-my $config_dir = prepareConfigDirectory( getAppName() );
-if ( not defined $config_dir ) {
-    leave "could not specify a configuration directory";
-}
+#my $config_dir = prepareConfigDirectory( getAppName() );
+my $cache_dir  = prepareCacheDirectory(  getAppName() );
+# FIXME: get time value from $configuration file???
 
-our $hitRecordFile = fs->catfile( $config_dir, $ShortcutName );
+#defined $config_dir or
+#  leave "could not specify a configuration directory";
+defined $cache_dir or
+  leave "could not specify a cache directory";
+
+our $hitRecordFile = fs->catfile( $cache_dir, $ShortcutName );
 
 my ( $pid, $prev_hit_time, $status ) = read_record_();
 $ReadyToHit = true;
@@ -145,7 +160,7 @@ if ( not defined $pid ) {
 else {
     # ref: http://perldoc.perl.org/perlipc.html#Signals
     if ( kill ( 0 => $pid ) || $!{EPERM} ) {
-        if ( $TimeBeg - $prev_hit_time < getHitIntervalTime() ) {
+        if ( $TimeBeg - $prev_hit_time < getHitIntervalTime( 'usec' ) ) {
             dmsg "interrupting previous process($pid) to update timestamp";
             kill INT => $pid; # this will update timesatmp
         }
@@ -173,28 +188,31 @@ info "This is first stroke!";
 $HitCount = 1;
 
 open_and_lock_ex_record_() or
-    leave "failed to open and lock the record";
+  leave "failed to open and lock the record";
 
 write_and_unlock_record_( $$, $HitTime, $HitCount );
-info "Will execute an external programme in ".getHitIntervalTime()." usec.";
+info "Will execute an external programme in "
+  .getHitIntervalTime( 'usec' )." usec.";
 
 wait_until_timeout:
 # note: look at handleInterrupt() what happens when interrupted.
 my $usec_to_wait = int( ( $TimeOut - getClockNow() ) * 1.0e6 );
 my $need_to_wait = boolean( $usec_to_wait > 0.0 );
 
-if ( $need_to_wait ) {
-    info "Really wait for $usec_to_wait usec.";
-    usleep( $usec_to_wait );
-    # process might caught SIGINT signal during usleep()
-}
+$need_to_wait and
+  info "Really wait for $usec_to_wait usec.",
+  usleep $usec_to_wait;
+#
+# process might caught SIGINT signal during usleep()
+#
+doesHitMaxCount() and
+  $need_to_wait = false, # no need to wait !!!
+  info "Hit the Maximum Hit Count: $MaxHitCount: do not wait any more";
 
-if ( doesHitMaxCount() ) {
-    $need_to_wait = false; # no need to wait !!!
-    info "Hit the Maximum Hit Count: $MaxHitCount: do not wait any more";
-}
-
 if ( $need_to_wait ) {
+    isDebugging and ++$dbg_numof_waiting_ > 100
+      and leave "something maybe went to wrong: stop waiting";
+
     goto wait_until_timeout;
 }
 else {
@@ -202,9 +220,9 @@ else {
 }
 
 my ( $prog_name, @prog_args ) = get_shortcut_prog_args_( $HitCount );
-if ( not defined $prog_name ) {
-    leave "Programme is not defined for Hit Number: $HitCount";
-}
+
+defined $prog_name or
+  leave "Programme is not defined for Hit Number: $HitCount";
 
 open_and_lock_ex_record_();
 write_and_unlock_record_( $$, $HitTime, StatusHitMaxCount );
@@ -213,12 +231,11 @@ write_and_unlock_record_( $$, $HitTime, StatusHitMaxCount );
 require File::Which;    File::Which->import();
 my $prog_real = File::Which::which( $prog_name );
 
-if ( not defined $prog_real ) {
+defined $prog_real or
     leave "Programme(or App) not found: $prog_name";
-}
 
 info "Exec: $prog_real: with args: @prog_args";
-{
+{   # :-(
     no warnings 'exec';
     exec( $prog_real, @prog_args );
 }
@@ -234,7 +251,7 @@ sub handleInterrupt () {
 
     ++$HitCount if $HitCount < $MaxHitCount;
     $HitTime = getClockNow();
-    $TimeOut = get_timeout_( $HitTime );
+    $TimeOut = get_timeout_ $HitTime;
 
     info "Current hit: $HitCount";
     # more chance to lock properly.
@@ -249,7 +266,7 @@ sub SigExitOnly () {
 private:
 sub get_timeout_ ($) {
     my $beginning = $_[0];
-    return $beginning + getHitIntervalTime() * 1.0e-6;
+    return $beginning + getHitIntervalTime( 'sec' );
 }
 
 sub get_shortcut_prog_args_ ($) {
@@ -287,7 +304,7 @@ sub open_and_lock_ex_record_ ()  {
 
         if ( ! flock( $record_file_handle_, LOCK_EX|LOCK_NB ) ) {
             dmsg "windows record file is locked: trying in 5000 usec";
-            usleep( 5000 );
+            usleep 5000;
             redo locking_file;
         }
     }
@@ -303,7 +320,7 @@ sub read_record_ (;$) {
         {
             if ( ! flock $record_fh, LOCK_EX|LOCK_NB) {
                 dmsg "hit record file is locked: trying in 0.005 sec";
-                usleep( 5000 );
+                usleep 5000;
                 redo locking_file;
             }
         }
